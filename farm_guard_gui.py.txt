@@ -1,0 +1,391 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import cv2
+import numpy as np
+import tensorflow as tf
+import serial
+import time
+import threading
+from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+import customtkinter as ctk
+from PIL import Image, ImageTk
+
+# Configuration CustomTkinter
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# ==========================================
+# 1. PARAMÈTRES DU SYSTÈME
+# ==========================================
+
+SERIAL_PORT = 'COM8'
+BAUD_RATE = 9600
+
+MODEL_PATH = "trained.tflite"
+LABELS = ["Baffula", "Nature", "Porc"]
+DISPLAY_NAMES = {"Baffula": "Buffalo", "Porc": "Pig", "Nature": "Nature"}
+
+SENDER_EMAIL = "omarmelah59@gmail.com"
+SENDER_PASSWORD = "pkej kjis rwvi wzdb"
+RECEIVER_EMAIL = "oumaradoummellah@gmail.com"
+
+EMAIL_COOLDOWN = 15
+last_email_time = 0
+
+DETECTION_COOLDOWN = 3.0
+last_detection_time = 0
+
+# Variables globales d'état
+buffalo_count = 0
+pig_count = 0
+current_distance = 0.0
+current_status = "SYSTEM ARMED & MONITORING"
+status_color = "#2ECC71"
+
+led_green_active = True
+led_red_active = False
+buzzer_active = False
+
+manual_override = False # Permet de bloquer temporairement l'automatisme lors d'un test manuel
+
+latest_frame = None
+is_running = True
+
+# ==========================================
+# 2. CHARGEMENT MODÈLE & SERIAL
+# ==========================================
+
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+height = input_details[0]['shape'][1]
+width = input_details[0]['shape'][2]
+input_type = input_details[0]['dtype']
+
+arduino = None
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    time.sleep(1.5)
+    arduino.reset_input_buffer()
+except Exception:
+    arduino = None
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0)
+
+# ==========================================
+# 3. ENVOI DES EMAILS D'ALERTE
+# ==========================================
+
+def send_alert_email_thread(animal_type, confidence_score, image_frame):
+    global last_email_time
+    current_time = time.time()
+    if current_time - last_email_time < EMAIL_COOLDOWN:
+        return
+
+    try:
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = MIMEMultipart()
+        msg['Subject'] = f"🚨 [SECURITY ALERT] Farm Guard: {animal_type.upper()} Detected!"
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+
+        body = f"""==================================================
+           FARM GUARD SYSTEM - SECURITY REPORT
+==================================================
+Target Identified : {animal_type}
+Confidence Level  : {confidence_score:.2f}%
+Timestamp         : {timestamp_str}
+Location          : Sector 1 (Main Perimeter)
+Hardware Action   : Buzzer Activated & Red LED Triggered
+=================================================="""
+        msg.attach(MIMEText(body, 'plain'))
+
+        _, img_encoded = cv2.imencode('.jpg', image_frame)
+        image_attachment = MIMEImage(img_encoded.tobytes(), name=f"incident_{animal_type}.jpg")
+        msg.attach(image_attachment)
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        last_email_time = current_time
+    except Exception:
+        pass
+
+# ==========================================
+# 4. TRAITEMENT EN ARRIÈRE-PLAN
+# ==========================================
+
+def background_worker():
+    global latest_frame, last_detection_time, buffalo_count, pig_count, current_status, status_color
+    global led_green_active, led_red_active, buzzer_active, current_distance, manual_override
+
+    while is_running:
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                latest_frame = frame.copy()
+
+        if arduino and arduino.in_waiting > 0:
+            try:
+                raw_data = arduino.readline().decode('utf-8', errors='ignore').strip()
+            except Exception:
+                raw_data = ""
+
+            if raw_data.startswith("DIST:"):
+                try:
+                    current_distance = float(raw_data.split(":")[1])
+                except Exception:
+                    pass
+
+            # Si le mode manuel n'est pas actif, on traite les détections automatiques
+            elif not manual_override:
+                if raw_data == "CHECK" and latest_frame is not None:
+                    current_time = time.time()
+                    if current_time - last_detection_time >= DETECTION_COOLDOWN:
+                        last_detection_time = current_time
+
+                        img_resized = cv2.resize(latest_frame, (width, height))
+                        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+
+                        if input_type == np.int8:
+                            input_data = (img_rgb.astype(np.int16) - 128).astype(np.int8)
+                        elif input_type == np.uint8:
+                            input_data = np.expand_dims(img_rgb.astype(np.uint8), axis=0)
+                        else:
+                            input_data = np.expand_dims(img_rgb.astype(np.float32) / 255.0, axis=0)
+
+                        if input_type == np.int8:
+                            input_data = np.expand_dims(input_data, axis=0)
+
+                        interpreter.set_tensor(input_details[0]['index'], input_data)
+                        interpreter.invoke()
+                        output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+                        if output_details[0]['dtype'] in [np.int8, np.uint8]:
+                            scale, zero_point = output_details[0]['quantization']
+                            if scale > 0:
+                                output_data = (output_data.astype(np.float32) - zero_point) * scale
+
+                        top_idx = np.argmax(output_data)
+                        raw_label = LABELS[top_idx] if top_idx < len(LABELS) else "Nature"
+                        label = DISPLAY_NAMES.get(raw_label, raw_label)
+                        confidence = output_data[top_idx] * 100 if output_data[top_idx] <= 1.0 else output_data[top_idx]
+
+                        if label in ["Buffalo", "Pig"]:
+                            current_status = f"🚨 INTRUSION: {label.upper()} ({confidence:.1f}%)"
+                            status_color = "#E74C3C"
+                            led_green_active = False
+                            led_red_active = True
+                            buzzer_active = True
+
+                            if label == "Buffalo": buffalo_count += 1
+                            elif label == "Pig": pig_count += 1
+
+                            try: arduino.write(b"ALERT\n")
+                            except Exception: pass
+                            threading.Thread(target=send_alert_email_thread, args=(label, confidence, latest_frame)).start()
+                        else:
+                            current_status = f"🌿 CLEAR ZONE (Nature {confidence:.1f}%)"
+                            status_color = "#2ECC71"
+                            led_green_active = True
+                            led_red_active = False
+                            buzzer_active = False
+                            try: arduino.write(b"NORMAL\n")
+                            except Exception: pass
+
+                elif raw_data == "CLEAR_DISTANCE":
+                    current_status = "SYSTEM ARMED & MONITORING"
+                    status_color = "#2ECC71"
+                    led_green_active = True
+                    led_red_active = False
+                    buzzer_active = False
+                    try: arduino.write(b"NORMAL\n")
+                    except Exception: pass
+
+        time.sleep(0.01)
+
+# ==========================================
+# 5. DASHBOARD PRO AVEC CONTRÔLES MANUELS
+# ==========================================
+
+class FarmGuardApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Farm Guard System — Command Center")
+        self.geometry("1120x720")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.grid_columnconfigure(0, weight=3)
+        self.grid_columnconfigure(1, weight=2)
+        self.grid_rowconfigure(0, weight=1)
+
+        # --- PANNEAU GAUCHE : FLUX VIDÉO ---
+        self.video_frame = ctk.CTkFrame(self, corner_radius=15)
+        self.video_frame.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
+
+        self.title_label = ctk.CTkLabel(self.video_frame, text="🛡️ Live Vision Monitor (1080p)", font=ctk.CTkFont(size=18, weight="bold"))
+        self.title_label.pack(pady=10)
+
+        self.video_label = ctk.CTkLabel(self.video_frame, text="")
+        self.video_label.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # --- PANNEAU DROIT : CONTRÔLE & STATISTIQUES ---
+        self.side_frame = ctk.CTkFrame(self, corner_radius=15)
+        self.side_frame.grid(row=0, column=1, padx=(0, 15), pady=15, sticky="nsew")
+
+        ctk.CTkLabel(self.side_frame, text="System Overview", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=(12, 6))
+
+        # 1. Carte de Statut Global
+        self.status_card = ctk.CTkFrame(self.side_frame, fg_color="#2ECC71", corner_radius=10)
+        self.status_card.pack(fill="x", padx=15, pady=4)
+        self.status_text = ctk.CTkLabel(self.status_card, text=current_status, font=ctk.CTkFont(size=13, weight="bold"), text_color="white")
+        self.status_text.pack(pady=10, padx=10)
+
+        # 2. Carte Capteur Ultrason
+        self.dist_card = ctk.CTkFrame(self.side_frame, corner_radius=10)
+        self.dist_card.pack(fill="x", padx=15, pady=4)
+        self.lbl_distance = ctk.CTkLabel(self.dist_card, text="📡 Ultrasonic Range: -- cm", font=ctk.CTkFont(size=13, weight="bold"))
+        self.lbl_distance.pack(pady=8)
+
+        # 3. Carte des Voyants Matériels
+        self.hw_status_card = ctk.CTkFrame(self.side_frame, corner_radius=10)
+        self.hw_status_card.pack(fill="x", padx=15, pady=4)
+        ctk.CTkLabel(self.hw_status_card, text="Hardware Indicators", font=ctk.CTkFont(size=12, weight="bold")).pack(pady=(6, 2))
+        
+        self.led_row = ctk.CTkFrame(self.hw_status_card, fg_color="transparent")
+        self.led_row.pack(fill="x", padx=10, pady=4)
+        
+        self.btn_green_led = ctk.CTkButton(self.led_row, text="🟢 Green", width=95, fg_color="#27AE60", state="disabled")
+        self.btn_green_led.pack(side="left", padx=2)
+
+        self.btn_red_led = ctk.CTkButton(self.led_row, text="🔴 Red", width=95, fg_color="#333333", state="disabled")
+        self.btn_red_led.pack(side="left", padx=2)
+
+        self.btn_buzzer = ctk.CTkButton(self.led_row, text="🔊 Buzzer", width=95, fg_color="#333333", state="disabled")
+        self.btn_buzzer.pack(side="left", padx=2)
+
+        # 4. SECTION CONTRÔLE MANUEL (COMMANDES OPERATEUR)
+        self.ctrl_card = ctk.CTkFrame(self.side_frame, corner_radius=10)
+        self.ctrl_card.pack(fill="x", padx=15, pady=6)
+        ctk.CTkLabel(self.ctrl_card, text="🎮 Manual Actuator Controls", font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(8, 4))
+
+        # Bouton Forcer Alarme
+        self.btn_force_alarm = ctk.CTkButton(self.ctrl_card, text="🚨 Trigger Alarm (Manual)", fg_color="#E74C3C", hover_color="#C0392B", command=self.manual_trigger_alarm)
+        self.btn_force_alarm.pack(fill="x", padx=12, pady=4)
+
+        # Bouton Réinitialiser / Normal
+        self.btn_reset_normal = ctk.CTkButton(self.ctrl_card, text="🟢 Reset System (Normal)", fg_color="#2ECC71", hover_color="#27AE60", command=self.manual_reset_normal)
+        self.btn_reset_normal.pack(fill="x", padx=12, pady=4)
+
+        # Bouton Mute Buzzer
+        self.btn_mute_buzzer = ctk.CTkButton(self.ctrl_card, text="🔇 Silence Buzzer", fg_color="#F39C12", hover_color="#D68910", command=self.manual_mute_buzzer)
+        self.btn_mute_buzzer.pack(fill="x", padx=12, pady=(4, 8))
+
+        # 5. Carte Statistiques Détections
+        self.stats_card = ctk.CTkFrame(self.side_frame, corner_radius=10)
+        self.stats_card.pack(fill="x", padx=15, pady=4)
+
+        self.lbl_buffalo = ctk.CTkLabel(self.stats_card, text="🐃 Buffalo Intrusions : 0", font=ctk.CTkFont(size=13))
+        self.lbl_buffalo.pack(anchor="w", padx=15, pady=(8, 2))
+
+        self.lbl_pig = ctk.CTkLabel(self.stats_card, text="🐖 Pig Intrusions : 0", font=ctk.CTkFont(size=13))
+        self.lbl_pig.pack(anchor="w", padx=15, pady=(0, 8))
+
+        # 6. Bouton Quitter
+        self.btn_quit = ctk.CTkButton(self.side_frame, text="Disarm & Exit", fg_color="#7F8C8D", hover_color="#95A5A6", command=self.on_close)
+        self.btn_quit.pack(side="bottom", fill="x", padx=15, pady=10)
+
+        self.update_gui()
+
+    # --- ACTIONS MANUELLES ---
+    def manual_trigger_alarm(self):
+        global current_status, status_color, led_green_active, led_red_active, buzzer_active, manual_override
+        manual_override = True
+        current_status = "⚠️ MANUAL OVERRIDE: ALARM ACTIVE"
+        status_color = "#E74C3C"
+        led_green_active = False
+        led_red_active = True
+        buzzer_active = True
+        if arduino:
+            try: arduino.write(b"ALERT\n")
+            except Exception: pass
+
+    def manual_reset_normal(self):
+        global current_status, status_color, led_green_active, led_red_active, buzzer_active, manual_override
+        manual_override = False
+        current_status = "SYSTEM ARMED & MONITORING"
+        status_color = "#2ECC71"
+        led_green_active = True
+        led_red_active = False
+        buzzer_active = False
+        if arduino:
+            try: arduino.write(b"NORMAL\n")
+            except Exception: pass
+
+    def manual_mute_buzzer(self):
+        global buzzer_active
+        buzzer_active = False
+        if arduino:
+            try: arduino.write(b"MUTE\n")
+            except Exception: pass
+
+    def update_gui(self):
+        global latest_frame
+        
+        self.status_text.configure(text=current_status)
+        self.status_card.configure(fg_color=status_color)
+        
+        if current_distance > 0:
+            self.lbl_distance.configure(text=f"📡 Ultrasonic Range: {current_distance:.1f} cm")
+        else:
+            self.lbl_distance.configure(text="📡 Ultrasonic Range: Clear")
+
+        # Mise à jour de la couleur des indicateurs matériels
+        self.btn_green_led.configure(fg_color="#2ECC71" if led_green_active else "#2C3E50")
+        self.btn_red_led.configure(fg_color="#E74C3C" if led_red_active else "#2C3E50")
+        self.btn_buzzer.configure(fg_color="#E67E22" if buzzer_active else "#2C3E50")
+
+        self.lbl_buffalo.configure(text=f"🐃 Buffalo Intrusions : {buffalo_count}")
+        self.lbl_pig.configure(text=f"🐖 Pig Intrusions : {pig_count}")
+
+        if latest_frame is not None:
+            frame_rgb = cv2.cvtColor(latest_frame, cv2.COLOR_BGR2RGB)
+            frame_resized = cv2.resize(frame_rgb, (680, 510))
+            img_pil = Image.fromarray(frame_resized)
+            img_tk = ImageTk.PhotoImage(image=img_pil)
+            self.video_label.configure(image=img_tk)
+            self.video_label.image = img_tk
+
+        self.after(30, self.update_gui)
+
+    def on_close(self):
+        global is_running
+        is_running = False
+        if arduino:
+            try:
+                arduino.write(b"NORMAL\n")
+                arduino.close()
+            except Exception: pass
+        cap.release()
+        self.destroy()
+
+# ==========================================
+# 6. EXÉCUTION
+# ==========================================
+
+if __name__ == "__main__":
+    t = threading.Thread(target=background_worker, daemon=True)
+    t.start()
+    app = FarmGuardApp()
+    app.mainloop()

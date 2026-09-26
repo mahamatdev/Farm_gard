@@ -1,0 +1,217 @@
+import cv2
+import numpy as np
+import tensorflow as tf
+import serial
+import time
+from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+
+# ==========================================
+# 1. PARAMÈTRES DU SYSTÈME
+# ==========================================
+
+SERIAL_PORT = 'COM8'  
+BAUD_RATE = 9600
+
+MODEL_PATH = "trained.tflite"
+LABELS = ["Baffula", "Nature", "Porc"]
+
+# Identifiants Email Gmail
+SENDER_EMAIL = "omarmelah59@gmail.com"        
+SENDER_PASSWORD = "pkej kjis rwvi wzdb"   
+RECEIVER_EMAIL = "oumaradoummellah@gmail.com"     
+
+EMAIL_COOLDOWN = 15  
+last_email_time = 0
+
+DETECTION_COOLDOWN = 3.0  # Pause de 3s entre chaque analyse IA
+last_detection_time = 0
+
+# ==========================================
+# 2. CHARGEMENT DU MODÈLE ET DE LA SÉRIE
+# ==========================================
+
+print("[ML] Loading TensorFlow Lite model...")
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+height = input_details[0]['shape'][1]
+width = input_details[0]['shape'][2]
+input_type = input_details[0]['dtype']
+
+print(f"[ML] Model loaded successfully! Input resolution: {width}x{height}")
+
+# Connexion Série Arduino avec vidage du tampon initial
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    arduino.reset_input_buffer() # Élimine les octets corrompus au démarrage
+    print(f"[SERIAL] Connected to Arduino on {SERIAL_PORT}")
+except Exception as e:
+    print(f"[SERIAL ERROR] Failed to connect to {SERIAL_PORT}: {e}")
+    arduino = None
+
+# ==========================================
+# 3. INITIALISATION DE LA WEBCAM
+# ==========================================
+
+def get_camera():
+    for idx in [1, 0, 2]:
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                print(f"✅ [CAM] Webcam connectée sur l'Index {idx} !")
+                return cap
+            cap.release()
+    print("[CAM ERROR] Aucune caméra fonctionnelle trouvée.")
+    return None
+
+cap = get_camera()
+
+# ==========================================
+# 4. ENVOI DU RAPPORT D'ALERTE EN ANGLAIS
+# ==========================================
+
+def send_alert_email(animal_type, confidence_score, image_frame):
+    global last_email_time
+    current_time = time.time()
+    
+    if current_time - last_email_time < EMAIL_COOLDOWN:
+        return
+
+    try:
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        msg = MIMEMultipart()
+        msg['Subject'] = f"🚨 [SECURITY ALERT] Farm Guard: {animal_type.upper()} Detected!"
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+
+        body = f"""==================================================
+           FARM GUARD SYSTEM - SECURITY REPORT
+==================================================
+
+[!] INTRUSION CONFIRMED BY VISION AI
+
+Details:
+--------------------------------------------------
+* Target Identified : {animal_type}
+* Confidence Level  : {confidence_score:.2f}%
+* Timestamp         : {timestamp_str}
+* Location          : Sector 1 (Main Perimeter)
+* Hardware Action   : Buzzer Activated & Red LED Triggered
+--------------------------------------------------
+
+A real-time snapshot captured by the USB Webcam is attached to this report.
+
+--
+Automated Security Dispatch - Farm Guard System.
+"""
+        msg.attach(MIMEText(body, 'plain'))
+
+        _, img_encoded = cv2.imencode('.jpg', image_frame)
+        image_attachment = MIMEImage(img_encoded.tobytes(), name=f"incident_{animal_type}_{datetime.now().strftime('%H%M%S')}.jpg")
+        msg.attach(image_attachment)
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+
+        print(f"📧 [EMAIL] Alert report sent for: {animal_type} ({confidence_score:.1f}%)")
+        last_email_time = current_time
+    except Exception as e:
+        print(f"❌ [EMAIL ERROR] Failed to send email: {e}")
+
+# ==========================================
+# 5. BOUCLE PRINCIPALE EN TEMPS RÉEL
+# ==========================================
+
+print("[SYSTEM] Farm Guard Controller Active. Waiting for ultrasonic trigger...")
+
+while True:
+    if cap:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.05)
+            continue
+    else:
+        break
+
+    # Surveillance de la liaison série avec gestion d'erreurs
+    if arduino and arduino.in_waiting > 0:
+        try:
+            # decode('utf-8', errors='ignore') évite le crash en cas d'octet corrompu
+            raw_data = arduino.readline().decode('utf-8', errors='ignore').strip()
+        except Exception:
+            raw_data = ""
+
+        if raw_data == "CHECK":
+            current_time = time.time()
+            
+            if current_time - last_detection_time >= DETECTION_COOLDOWN:
+                last_detection_time = current_time
+
+                # Prétraitement de l'image (96x96 RGB)
+                img_resized = cv2.resize(frame, (width, height))
+                img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+
+                if input_type == np.int8:
+                    input_data = (img_rgb.astype(np.int16) - 128).astype(np.int8)
+                    input_data = np.expand_dims(input_data, axis=0)
+                elif input_type == np.uint8:
+                    input_data = np.expand_dims(img_rgb.astype(np.uint8), axis=0)
+                else:
+                    input_data = np.expand_dims(img_rgb.astype(np.float32) / 255.0, axis=0)
+
+                # Inférence TFLite
+                interpreter.set_tensor(input_details[0]['index'], input_data)
+                interpreter.invoke()
+                output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+
+                if output_details[0]['dtype'] in [np.int8, np.uint8]:
+                    scale, zero_point = output_details[0]['quantization']
+                    if scale > 0:
+                        output_data = (output_data.astype(np.float32) - zero_point) * scale
+
+                top_idx = np.argmax(output_data)
+                label = LABELS[top_idx] if top_idx < len(LABELS) else "Nature"
+                confidence = output_data[top_idx]
+                if confidence <= 1.0: 
+                    confidence *= 100
+
+                print(f"[ANALYSIS] Target Identified: {label} ({confidence:.1f}%)")
+
+                # Contrôle matériel et alertes
+                if label in ["Baffula", "Porc"]:
+                    print(f"🚨 INTRUSION DETECTED ({label}) -> Triggering Alarm & Red LED!")
+                    arduino.write(b"ALERT\n")
+                    send_alert_email(label, confidence, frame)
+                else:
+                    print("🌿 Non-threat target (Nature) -> Keeping Green LED ON.")
+                    arduino.write(b"NORMAL\n")
+
+        elif raw_data == "CLEAR_DISTANCE":
+            arduino.write(b"NORMAL\n")
+
+    # Affichage de la fenêtre vidéo
+    cv2.imshow("Farm Guard - Live USB Surveillance Monitor", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+if arduino: 
+    arduino.close()
+if cap:
+    cap.release()
+cv2.destroyAllWindows()

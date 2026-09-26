@@ -1,0 +1,31 @@
+import cv2
+
+print("🔍 Recherche des caméras disponibles...")
+
+for idx in [0, 1, 2, 3]:
+    # Test avec DirectShow (CAP_DSHOW)
+    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        # Test avec le pilote par défaut
+        cap = cv2.VideoCapture(idx)
+        
+    if cap.isOpened():
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            print(f"✅ Caméra trouvée et fonctionnelle sur l'INDEX : {idx}")
+            print("👉 Fermez la fenêtre vidéo (touche 'q') pour valider.")
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                cv2.putText(frame, f"Camera Index: {idx}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.imshow(f"Test Camera Index {idx}", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            cap.release()
+            cv2.destroyAllWindows()
+            break
+        cap.release()
+    else:
+        print(f"❌ Index {idx} non disponible.")
+
+print("Fin du test.")
